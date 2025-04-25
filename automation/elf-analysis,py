@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+
+import os
+import re
+from typing import List, Tuple
+import magic  # Install with: pip install python-magic
+import argparse
+import random
+import string
+import sys
+
+# Attempt to import colorama, provide instructions if missing
+try:
+    import colorama
+    from colorama import Fore, Style, Back
+    # Initialize colorama - autoreset=True automatically adds Style.RESET_ALL
+    colorama.init(autoreset=True)
+except ImportError:
+    print("Error: 'colorama' library not found.")
+    print("Please install it using: pip install colorama")
+    # Define dummy color objects so the script doesn't crash immediately
+    class DummyColor:
+        def __getattr__(self, name):
+            return ""
+    Fore = Style = Back = DummyColor()
+    # No colorama.init() if import failed
+
+# --- Color Constants (Defined even if colorama fails, will be empty strings) ---
+INFO = Fore.CYAN
+SUCCESS = Fore.GREEN
+WARNING = Fore.YELLOW
+ERROR = Fore.RED
+HIGHLIGHT = Fore.MAGENTA # For important findings like target calls
+DIM = Style.DIM # For less important info
+BRIGHT = Style.BRIGHT # For titles
+RESET = Style.RESET_ALL # Generally handled by autoreset=True
+
+# --- Ghidra Initialization ---
+try:
+    print(f"{INFO}[!] Loading Ghidra...")
+    import pyghidra
+    pyghidra.start()
+    print(f"{INFO}[!] Ghidra Loaded.")
+    # Import Ghidra components after pyghidra.start()
+    from ghidra.util.task import ConsoleTaskMonitor
+    from ghidra.app.decompiler.flatapi import FlatDecompilerAPI
+    from ghidra.app.decompiler import DecompileOptions
+except ImportError:
+    print(f"{ERROR}[!] Error: pyghidra or Ghidra components not found.")
+    print(f"{WARNING}    Ensure Ghidra is installed and pyghidra is configured correctly.")
+    sys.exit(1)
+except Exception as e:
+    print(f"{ERROR}[!] An unexpected error occurred during Ghidra initialization: {e}")
+    sys.exit(1)
+# --- End Ghidra Initialization ---
+
+def generate_random_string(length=6):
+    """Generates a random string of the specified length (default 6)."""
+    characters = string.ascii_letters + string.digits
+    return ''.join(random.choices(characters, k=length))
+
+def find_target_function_calls(code_str: str, target_functions: List[str]) -> List[Tuple[str, str]]:
+    """
+    Finds calls to any of the specified target functions within a code string.
+
+    Args:
+        code_str: The string containing the code (presumably C code).
+        target_functions: A list of function names (lowercase) to search for.
+
+    Returns:
+        A list of tuples, where each tuple is (found_function_name, arguments_string).
+        Returns an empty list if no target functions are found or inputs are invalid.
+    """
+    found_calls = []
+    if not target_functions or not code_str:
+        return found_calls
+
+    # Create a regex pattern to match any of the target functions
+    # Use re.escape to handle potential special characters in function names
+    # Pattern: \b(func1|func2|...)\s*\((.*?)\)
+    try:
+        # Ensure function names are escaped for regex safety
+        escaped_funcs = [re.escape(func) for func in target_functions]
+        pattern_str = r'\b(' + '|'.join(escaped_funcs) + r')\s*\((.*?)\)'
+
+        # Use re.finditer to get match objects, allowing access to captured groups
+        # Use re.IGNORECASE for case-insensitivity and re.DOTALL for '.' to match newlines in args
+        for match in re.finditer(pattern_str, code_str, re.IGNORECASE | re.DOTALL):
+            function_name_matched = match.group(1) # The specific function name found
+            arguments = match.group(2)           # The arguments inside the parentheses
+            found_calls.append((function_name_matched, arguments))
+    except re.error as e:
+        print(f"  {ERROR}[!] Regex error while searching for target functions: {e}")
+    except Exception as e:
+        print(f"  {ERROR}[!] Unexpected error during regex search: {e}")
+
+
+    return found_calls
+
+def find_elf_files(directory: str) -> List[str]:
+    """
+    Recursively scans a directory and its subdirectories for ELF files, using
+    magic file checks for identification, returning their full file paths.
+
+    Args:
+        directory: The directory to start the search from.
+
+    Returns:
+        A list of full file paths to ELF files found.
+    """
+    elf_files: List[str] = []
+    if not os.path.isdir(directory):
+        print(f"{ERROR}[!] Error: Directory not found or is not a directory: {directory}")
+        return elf_files
+
+    print(f"{INFO}[*] Scanning directory: {directory}")
+    for root, _, files in os.walk(directory):
+        for file in files:
+            full_path = os.path.join(root, file)
+
+            # Skip common non-executable or specific file types if needed
+            if ".so" in full_path or '.ko' in full_path:
+                continue
+
+            # Skip symbolic links (often point to busybox or similar)
+            if os.path.islink(full_path):
+                # print(f"{DIM}[*] Skipping symlink: {full_path}") # Optional: uncomment if needed
+                continue
+
+            # Check file type using python-magic
+            try:
+                # Ensure it's a file and readable before opening
+                if not os.path.isfile(full_path) or not os.access(full_path, os.R_OK):
+                    # print(f"{DIM}[*] Skipping non-file or unreadable: {full_path}") # Optional
+                    continue
+
+                with open(full_path, 'rb') as f:
+                    # Read a small chunk for magic number check
+                    file_header = f.read(1024)
+                    if not file_header: # Handle empty files
+                        continue
+                    file_type = magic.from_buffer(file_header)
+                    # Check if 'ELF' is present in the description
+                    if "ELF" in file_type:
+                        # print(f"{DIM}[*] Found ELF: {full_path} ({file_type})") # Optional: uncomment if needed
+                        elf_files.append(full_path)
+            except FileNotFoundError:
+                 # File might disappear between os.walk and open (rare)
+                 print(f"{WARNING}[!] Warning: File not found during check: {full_path}")
+                 continue
+            except IsADirectoryError:
+                 # Should not happen with os.walk(files), but good to handle
+                 print(f"{WARNING}[!] Warning: Expected file, found directory: {full_path}")
+                 continue
+            except PermissionError:
+                 print(f"{WARNING}[!] Warning: Permission denied for file: {full_path}")
+                 continue
+            except Exception as e:
+                 # Catch other potential errors (e.g., from magic)
+                 print(f"{ERROR}[!] Error checking file type for {full_path}: {e}")
+                 continue # Skip this file on error
+
+    return elf_files
+
+def import_and_analyze_files(elf_files: List[str], target_function_names: List[str], project_name: str, project_location: str, verbose: bool = True):
+    """
+    Imports ELF files into Ghidra, analyzes them, searches for specific functions,
+    finds their cross-references (xrefs), decompiles the referencing functions,
+    and looks for calls to the target functions within the decompiled code.
+
+    Args:
+        elf_files: A list of paths to ELF files.
+        target_function_names: A list of function names (lowercase) to search for.
+        project_name: The name for the Ghidra project.
+        project_location: The directory where the Ghidra project will be stored.
+    """
+    print(f"\n{INFO}[*] Analyzing {len(elf_files)} ELF files for functions: {HIGHLIGHT}{', '.join(target_function_names)}{RESET}")
+    print(f"{INFO}[*] Using Ghidra project '{project_name}' in '{os.path.abspath(project_location)}'")
+
+    # Ensure the output directory for decompiled code exists
+    output_code_dir = 'code'
+    if not os.path.exists(output_code_dir):
+        try:
+            os.makedirs(output_code_dir)
+            print(f"{SUCCESS}[*] Created directory for decompiled code: {output_code_dir}")
+        except OSError as e:
+            print(f"{ERROR}[!] Error creating output directory '{output_code_dir}': {e}")
+            # Decide if you want to exit or continue without saving code
+            # For now, we'll just print the error and continue processing
+
+    processed_count = 0
+    found_count = 0
+    monitor = ConsoleTaskMonitor() # Re-use monitor object
+
+    for file_path in elf_files:
+        processed_count += 1
+        print(f"\n{BRIGHT}[{processed_count}/{len(elf_files)}] Processing: {file_path}{RESET}")
+        analysis_needed = False
+        found_target_functions_in_file = [] # Track functions found in this specific file
+
+        try:
+            # Use the provided project name and location
+            # Analyze=False initially, we only analyze if a target function is found
+            with pyghidra.open_program(file_path,
+                                      analyze=False, # Analyze only if needed
+                                      project_location=project_location,
+                                      project_name=project_name) as flat_api:
+
+                program = flat_api.getCurrentProgram()
+                if not program:
+                    print(f"  {ERROR}[!] Failed to open program: {file_path}")
+                    continue
+
+                fm = program.getFunctionManager()
+                funcs = fm.getFunctions(True) # True -> iterate forward
+
+                # --- First Pass: Check if any target functions exist ---
+                for func in funcs:
+                    # Use getName(True) to get name with namespace if needed, but usually getName() is fine
+                    function_name = func.getName()
+                    # Compare lowercase names for case-insensitivity
+                    if function_name.lower() in target_function_names:
+                        analysis_needed = True
+                        found_target_functions_in_file.append(func) # Store the function object
+                        print(f"  {SUCCESS}[+] Found target function '{HIGHLIGHT}{function_name}{SUCCESS}' @ {func.getEntryPoint()}")
+                        found_count += 1
+                        # Don't break here, find all occurrences in the first pass
+
+                # --- Analysis and Decompilation (only if needed) ---
+                if analysis_needed:
+                    print(f"  {INFO}[*] Target function(s) found. Analyzing '{os.path.basename(file_path)}'...")
+                    # Analyze the program (this can take time)
+                    transaction_id = -1 # Initialize transaction ID
+                    try:
+                         # Capture the integer transaction ID returned by startTransaction
+                         transaction_id = program.startTransaction("Analysis")
+                         if transaction_id < 0:
+                              print(f"  {ERROR}[!] Failed to start analysis transaction for {file_path}")
+                              continue # Skip analysis if transaction couldn't start
+
+                         # Perform analysis within the transaction
+                         # Using analyzeAll for simplicity
+                         flat_api.analyzeAll(program)
+
+                         # Use the captured transaction_id (int) here
+                         program.endTransaction(transaction_id, True) # True = commit changes
+                         transaction_id = -1 # Reset ID after successful end
+                         print(f"  {SUCCESS}[*] Analysis complete for '{os.path.basename(file_path)}'.")
+
+                    except Exception as analysis_err:
+                         print(f"  {ERROR}[!] Error during analysis for {file_path}: {analysis_err}")
+                         # Attempt to end transaction even on error, if it was successfully started
+                         if transaction_id >= 0:
+                             try:
+                                 # Use the captured transaction_id (int) here, False = rollback
+                                 program.endTransaction(transaction_id, False)
+                                 print(f"  {WARNING}[*] Rolled back analysis transaction for {file_path} due to error.")
+                             except Exception as end_err:
+                                 # This might happen if the error left Ghidra in a bad state
+                                 print(f"  {ERROR}[!] Error trying to end/rollback transaction: {end_err}")
+                             transaction_id = -1 # Reset ID even if ending failed
+                         continue # Skip xref finding for this file if analysis failed
+
+                    # --- Second Pass (after analysis): Find XRefs and Decompile ---
+                    # Re-iterate through the functions *we found* in the first pass
+                    for func in found_target_functions_in_file:
+                        function_name = func.getName() # Get name again for clarity
+                        entry_point = func.getEntryPoint()
+                        print(f"  {INFO}[*] Getting cross-references (xrefs) to '{HIGHLIGHT}{function_name}{INFO}' @ {entry_point}")
+
+                        # Get references *after* analysis
+                        references = flat_api.getReferencesTo(entry_point)
+                        xrefs_summary = {} # Track calls per referencing function for this target
+                        decomp_api = None # Initialize decompiler API once if needed per target func
+
+                        if not references:
+                            print(f"  {WARNING}[*] No xrefs found for '{function_name}' in this file.")
+                            continue # Skip to next found target function in this file
+
+                        try:
+                            for xref in references:
+                                xref_addr = xref.getFromAddress()
+                                # Find the function containing the cross-reference
+                                calling_function = fm.getFunctionContaining(xref_addr)
+
+                                if calling_function:
+                                    calling_function_name = calling_function.getName()
+                                    if verbose:
+                                        print(f"  -> Xref from: '{calling_function_name}' @ {calling_function.getEntryPoint()} (call at {xref_addr})")
+
+                                    # Avoid redundant decompilation of the same function within the loop for this target
+                                    if calling_function_name in xrefs_summary:
+                                         # We might have already processed this caller for this target function
+                                         # but we still report the xref location
+                                         continue # Skip decompilation if already done for this caller
+
+                                    # Initialize decompiler if not done yet for this target function's xrefs
+                                    if decomp_api is None:
+                                        print(f"  {INFO}[*] Initializing decompiler...")
+                                        decomp_api = FlatDecompilerAPI(flat_api)
+                                        decomp_api.initialize()
+                                        options = DecompileOptions()
+                                        # Configure options if needed
+                                        decomp_api.getDecompiler().setOptions(options)
+
+                                    print(f"  {INFO}[*] Decompiling '{calling_function_name}'...")
+                                    # FlatDecompilerAPI.decompile returns the C code directly as a string
+                                    code_string = decomp_api.decompile(calling_function)
+
+                                    # Check if the decompilation returned a valid (non-empty) string
+                                    if code_string:
+                                        # Find calls to *any* of the target functions within this decompiled code string
+                                        target_call_matches = find_target_function_calls(code_string, target_function_names)
+
+                                        if target_call_matches:
+                                            # Store count for summary
+                                            xrefs_summary[calling_function_name] = len(target_call_matches)
+                                            # Update print message to be generic
+                                            print(f"    {HIGHLIGHT}[!] Found {len(target_call_matches)} target function call(s) in '{calling_function_name}':")
+                                            if verbose:
+                                                # Iterate through the found calls (tuples)
+                                                for func_name_found, args_match in target_call_matches:
+                                                    arg_preview = args_match.strip()[:100] # Limit argument preview length
+                                                    # Print the *actual* function name found
+                                                    print(f"      - {func_name_found}({DIM}{arg_preview}{'...' if len(args_match.strip()) > 100 else ''}{RESET})")
+
+                                            # Save the decompiled code containing target calls
+                                            try:
+                                                # Sanitize filenames
+                                                sanitized_basename = re.sub(r'[^\w\-.]', '_', os.path.basename(file_path))
+                                                sanitized_funcname = re.sub(r'[^\w\-.]', '_', calling_function_name)
+                                                output_filename = os.path.join(output_code_dir, f"{sanitized_basename}-{sanitized_funcname}-{generate_random_string()}.c")
+
+                                                with open(output_filename, 'w', encoding='utf-8') as output_file:
+                                                    output_file.write(f"// Decompiled from: {file_path}\n")
+                                                    output_file.write(f"// Function: {calling_function_name}\n")
+                                                    output_file.write(f"// Found xref to: {function_name}\n") # The original function we searched xrefs for
+                                                    # Mention *which* target calls were found inside this decompiled code
+                                                    found_funcs_in_code = sorted(list(set(call[0].lower() for call in target_call_matches))) # Unique, sorted list
+                                                    output_file.write(f"// Contains calls to: {', '.join(found_funcs_in_code)}\n\n")
+                                                    output_file.write(code_string) # Write the decompiled string
+                                                print(f"    {SUCCESS}[*] Saved decompiled code to: {output_filename}")
+                                            except IOError as e:
+                                                print(f"    {ERROR}[!] Error saving decompiled code for {calling_function_name}: {e}")
+                                            except Exception as e_save:
+                                                print(f"    {ERROR}[!] Unexpected error saving code: {e_save}")
+
+                                        else:
+                                             # Track that we decompiled but found no target calls for summary
+                                             if calling_function_name not in xrefs_summary:
+                                                  xrefs_summary[calling_function_name] = 0
+                                             # Update message to be generic
+                                             print(f"  {WARNING}[*] Decompiled '{calling_function_name}', no target function calls found related to this xref.")
+
+                                    else:
+                                        # Decompilation failed or returned an empty string/None
+                                        print(f"  {ERROR}[!] Failed to decompile '{calling_function_name}'.")
+                                        if calling_function_name not in xrefs_summary:
+                                            xrefs_summary[calling_function_name] = -1 # Indicate decompilation failure
+                                else:
+                                    # Xref address not contained within a known function
+                                    print(f"  -> Xref from address {xref_addr} (outside known function boundaries?)")
+                        except Exception as xref_err:
+                             print(f"  {ERROR}[!] Error processing xrefs for '{function_name}': {xref_err}")
+                             # Ensure decompiler is disposed if it was created
+                             if decomp_api:
+                                try:
+                                    decomp_api.dispose()
+                                except Exception as dispose_err:
+                                     print(f"  {ERROR}[!] Error disposing decompiler: {dispose_err}")
+                             decomp_api = None # Reset for next function or file
+                             continue # Move to next target function or file on error
+
+                        finally:
+                            # Dispose decompiler if it was used for this target function's xrefs
+                            if decomp_api:
+                                try:
+                                    decomp_api.dispose()
+                                except Exception as dispose_err:
+                                     print(f"  {ERROR}[!] Error disposing decompiler: {dispose_err}")
+                                decomp_api = None # Reset
+
+                        # --- Print Summary for the current target function ---
+                        if xrefs_summary:
+                            # Update message to be generic
+                            print(f"  {INFO}[*] Summary of target function calls within functions calling '{HIGHLIGHT}{function_name}{INFO}':")
+                            sorted_summary = sorted(xrefs_summary.items(), key=lambda item: item[0]) # Sort by calling function name
+                            for caller, count in sorted_summary:
+                                if count == -1:
+                                     status = f"{ERROR}Decompilation Failed"
+                                elif count == 0:
+                                     # Update message to be generic
+                                     status = f"{WARNING}No target function calls found"
+                                else:
+                                     # Update message to be generic
+                                     status = f"{HIGHLIGHT}Found {count} target function call(s)"
+                                print(f"    - {caller}: {status}") # Status is now colored
+                        else:
+                            # This case might occur if xrefs existed but none were in known functions or decompilation failed early
+                             # Update message to be generic
+                             print(f"  {WARNING}[*] No target function call summary generated for callers of '{function_name}'.")
+
+                else:
+                     # No target functions from the list were found in this file initially
+                     print(f"  {DIM}[*] No target functions found in '{os.path.basename(file_path)}'. Skipping analysis.")
+
+        except FileNotFoundError:
+             print(f"  {ERROR}[!] Error: File not found during Ghidra processing: {file_path}")
+        except RuntimeError as ghidra_err:
+            # Catch potential Ghidra/pyghidra runtime errors
+            print(f"  {ERROR}[!] Ghidra Runtime Error processing {file_path}: {ghidra_err}")
+        except Exception as e:
+            # Catch any other unexpected error during file processing
+            print(f"  {ERROR}[!] An unexpected error occurred processing {file_path}: {e}")
+            import traceback
+            traceback.print_exc() # Print traceback for unexpected errors
+        finally:
+             # Consider adding cleanup here if needed, e.g., explicitly closing resources
+             # although the `with` statement handles the flat_api/program closing.
+             pass
+
+    print(f"\n{SUCCESS}[*] Finished processing all files.")
+    print(f"{SUCCESS}[*] Total target function instances found across all files: {found_count}")
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # Colorama should be initialized already if import succeeded
+
+    parser = argparse.ArgumentParser(
+        description="Scan a directory for ELF files, analyze them with Ghidra, find specified functions, "
+                    "their xrefs, decompile callers, and search for calls to the specified functions within the decompiled code.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
+    )
+
+    # Required argument: Input directory
+    parser.add_argument(
+        "input_directory",
+        help="The directory path to recursively scan for ELF files."
+    )
+
+    # Optional argument: Function names
+    parser.add_argument(
+        "-f", "--functions",
+        nargs='+',
+        default=["system"], # Default function(s) to look for
+        metavar='FUNC_NAME', # Example name for help message
+        help="Space-separated list of function names to search for (case-insensitive)."
+    )
+
+    # Optional argument: Ghidra Project Name
+    parser.add_argument(
+        "-p", "--project-name",
+        default="GhidraAnalysisProject",
+        help="Name for the Ghidra project."
+    )
+
+    # Optional argument: Ghidra Project Location
+    parser.add_argument(
+        "-l", "--project-location",
+        default=".", # Default to current directory
+        help="Directory where the Ghidra project files will be stored."
+    )
+
+    parser.add_argument(
+        "-v", "--verbose",
+        action='store_true',
+        help="Verbose output to show xrefs and print matching lines to output"
+    )
+
+    args = parser.parse_args()
+
+    # Process function names to be lowercase for consistent comparison
+    target_funcs_lower = [name.lower() for name in args.functions]
+
+    # --- Start the process ---
+    print(f"\n{BRIGHT}[+] Ghidra ELF Analyzer{RESET}")
+    print(f"[+] Input Directory: {args.input_directory}")
+    print(f"[+] Target Functions: {HIGHLIGHT}{', '.join(target_funcs_lower)}{RESET}")
+    print(f"[+] Ghidra Project Name: {args.project_name}")
+    print(f"[+] Ghidra Project Location: {args.project_location}")
+
+    # 1. Find ELF files
+    print(f"\n{INFO}[+] Scanning for ELF files...")
+    elf_list = find_elf_files(args.input_directory)
+    if not elf_list:
+        print(f"{WARNING}[!] No ELF files found in the specified directory. Exiting.")
+        sys.exit(0)
+    print(f"  [-] Found {len(elf_list)} ELF files.")
+    # print(elf_list) # Uncomment to print the full list if needed
+
+    # 2. Import, analyze, and find xrefs using Ghidra
+    try:
+        import_and_analyze_files(
+            elf_list,
+            target_funcs_lower, # Pass the lowercase list
+            args.project_name,
+            args.project_location,
+            args.verbose
+        )
+    except Exception as main_err:
+        print(f"\n{ERROR}[!] An unexpected error occurred during the main analysis process: {main_err}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+    print(f"\n{SUCCESS}[+] Script finished.")
+    sys.exit(0)
